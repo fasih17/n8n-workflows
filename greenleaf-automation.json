@@ -1,0 +1,410 @@
+{
+  "name": "greenleaf-automation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "greenleaf-intake",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "07da0007-f244-406a-a417-ca54e4f85c01",
+      "name": "Webhook",
+      "webhookId": "2491c6b0-e28d-49df-bdf8-7c72b31090cb"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gpt-4o-mini",
+          "mode": "list",
+          "cachedResultName": "GPT-4O-MINI"
+        },
+        "responses": {
+          "values": [
+            {
+              "role": "system",
+              "content": "You are an AI triage assistant for GreenLeaf Property Management. \nYour job is to analyze incoming maintenance requests from tenants and extract structured information.\n\nYou must always respond with ONLY a valid JSON object — no explanation, no markdown, no extra text.\n\nClassify the request as:\n- \"Emergency\" if it involves: no heat, no water, flooding, gas leak, fire, sewage, \n  electrical hazard, security issue, or anything that threatens health and safety.\n- \"Routine\" for everything else (leaky faucet, broken appliance, cosmetic damage, etc.)\n\nIf the request is incoherent or missing key details, set category to \"Needs Review\" \nand summarize what information is missing."
+            },
+            {
+              "content": "=Please analyze this maintenance request and return ONLY a JSON object with exactly these fields — no extra text, no markdown:\n\n{\n  \"category\": \"Emergency\" or \"Routine\" or \"Needs Review\",\n  \"priority\": \"High\" or \"Normal\" or \"Review\",\n  \"summary\": \"A clear 1-2 sentence summary of the issue\",\n  \"property_address\": \"The property address from the request\",\n  \"tenant_name\": \"The tenant name from the request\",\n  \"recommended_action\": \"What should be done next\",\n  \"missing_info\": null or \"what is missing\"\n}\n\nTenant Name: {{ $('Webhook').item.json.body.tenant_name }}\nProperty Address: {{ $('Webhook').item.json.body.property_address }}\nIssue Description: {{ $('Webhook').item.json.body.issue_description }}\nSubmitted At: {{ $('Webhook').item.json.body.submitted_at }}"
+            }
+          ]
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 2.1,
+      "position": [
+        208,
+        0
+      ],
+      "id": "5a312b96-9d23-4df2-934b-aa8c2248f384",
+      "name": "Message a model",
+      "credentials": {
+        "openAiApi": {
+          "id": "CO3gC61lsYpaoKne",
+          "name": "OpenAI account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// GreenLeaf Property Management — AI Response Parser\n// Custom business logic for maintenance request triage\n// ============================================================\n\nconst inputData = $input.first().json;\n\n// Extract AI response from n8n OpenAI node output structure\nconst aiResponse = \n  inputData?.output?.[0]?.content?.[0]?.text ||     // confirmed path\n  inputData?.message?.content ||                     // fallback 1\n  inputData?.text ||                                 // fallback 2\n  inputData?.choices?.[0]?.message?.content ||       // fallback 3\n  null;\n\n// ── EDGE CASE: AI response unreadable ──────────────────────\nif (!aiResponse) {\n  return [{\n    json: {\n      category: \"Needs Review\",\n      priority: \"Review\",\n      summary: \"Could not read AI response — manual review needed\",\n      property_address: $('Webhook').item.json.body.property_address || \"Unknown\",\n      tenant_name: $('Webhook').item.json.body.tenant_name || \"Unknown\",\n      recommended_action: \"Flag for human coordinator review\",\n      missing_info: \"AI response structure unrecognized\",\n      contact_email: $('Webhook').item.json.body.contact_email || \"Unknown\",\n      sla_hours: 24,\n      escalate: true,\n      timestamp: new Date().toISOString(),\n      formatted_date: new Date().toLocaleDateString('en-US', {\n        year: 'numeric', month: 'long', day: 'numeric',\n        hour: '2-digit', minute: '2-digit'\n      })\n    }\n  }];\n}\n\n// ── CLEAN AI RESPONSE ──────────────────────────────────────\nconst cleaned = aiResponse\n  .replace(/```json/g, '')\n  .replace(/```/g, '')\n  .trim();\n\n// ── PARSE JSON ─────────────────────────────────────────────\nlet parsed;\ntry {\n  parsed = JSON.parse(cleaned);\n} catch (error) {\n  parsed = {\n    category: \"Needs Review\",\n    priority: \"Review\",\n    summary: \"Could not parse AI response — manual review needed\",\n    property_address: $('Webhook').item.json.body.property_address || \"Unknown\",\n    tenant_name: $('Webhook').item.json.body.tenant_name || \"Unknown\",\n    recommended_action: \"Flag for human coordinator review\",\n    missing_info: \"AI response was malformed: \" + aiResponse\n  };\n}\n\n// ── BUSINESS LOGIC: SLA RULES ──────────────────────────────\n// Automatically assign SLA response times based on category\n// Emergency = 2 hours, Routine = 48 hours, Review = 24 hours\nconst slaMap = {\n  \"Emergency\": 2,\n  \"Routine\": 48,\n  \"Needs Review\": 24\n};\n\nparsed.sla_hours = slaMap[parsed.category] || 24;\n\n// ── BUSINESS LOGIC: SLA DEADLINE ──────────────────────────\n// Calculate the exact deadline timestamp for this request\nconst now = new Date();\nconst deadline = new Date(now.getTime() + parsed.sla_hours * 60 * 60 * 1000);\nparsed.sla_deadline = deadline.toLocaleDateString('en-US', {\n  year: 'numeric', month: 'long', day: 'numeric',\n  hour: '2-digit', minute: '2-digit'\n});\n\n// ── BUSINESS LOGIC: ESCALATION FLAG ───────────────────────\n// Flag anything that needs immediate human attention\nparsed.escalate = parsed.category === \"Emergency\" || \n                  parsed.category === \"Needs Review\";\n\n// ── BUSINESS LOGIC: PRIORITY SCORE ────────────────────────\n// Numeric score for sorting/filtering in Google Sheets\nconst priorityScore = {\n  \"Emergency\": 1,\n  \"Routine\": 2,\n  \"Needs Review\": 3\n};\nparsed.priority_score = priorityScore[parsed.category] || 3;\n\n// ── ADD TENANT CONTACT DETAILS ─────────────────────────────\nparsed.contact_email = $('Webhook').item.json.body.contact_email || \"Unknown\";\n\n// ── ADD TIMESTAMPS ─────────────────────────────────────────\nparsed.timestamp = now.toISOString();\nparsed.formatted_date = now.toLocaleDateString('en-US', {\n  year: 'numeric', month: 'long', day: 'numeric',\n  hour: '2-digit', minute: '2-digit'\n});\n\nreturn [{ json: parsed }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        544,
+        -64
+      ],
+      "id": "9ede00c5-1582-457d-b333-e6920f60424d",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "https://docs.google.com/spreadsheets/d/1W4xDv9yZ60v7rZJE9xaSylo0QySl5YtCrqIoijVa8gM/edit?gid=0#gid=0",
+          "mode": "url"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "0",
+          "mode": "id"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "category",
+              "displayName": "category",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "priority",
+              "displayName": "priority",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "summary",
+              "displayName": "summary",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "property_address",
+              "displayName": "property_address",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "tenant_name",
+              "displayName": "tenant_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "recommended_action",
+              "displayName": "recommended_action",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "missing_info",
+              "displayName": "missing_info",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sla_hours",
+              "displayName": "sla_hours",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "sla_deadline",
+              "displayName": "sla_deadline",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "escalate",
+              "displayName": "escalate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "priority_score",
+              "displayName": "priority_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "contact_email",
+              "displayName": "contact_email",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "formatted_date",
+              "displayName": "formatted_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        560,
+        144
+      ],
+      "id": "9bc65d9b-ae2d-420f-8fec-33a401ea4c0b",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "QHvg9hQpW9UxKxfZ",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "6d470bf5-7764-46cf-ac40-57b21b2e8ef4",
+              "leftValue": "={{ $json.category }}",
+              "rightValue": "Emergency",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        784,
+        0
+      ],
+      "id": "dce2ebe5-540f-4c6d-9691-05012ce9737d",
+      "name": "If",
+      "notesInFlow": false,
+      "executeOnce": false,
+      "alwaysOutputData": false,
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "sendTo": "kfasih68@gmail.com",
+        "subject": "=🚨 EMERGENCY Maintenance Request - {{ $('Webhook').item.json.body.property_address }}",
+        "message": "=URGENT MAINTENANCE REQUEST - IMMEDIATE ACTION REQUIRED  Tenant: {{ $json.tenant_name }} Property: {{ $json.property_address }} Category: {{ $json.category }} Priority: {{ $json.priority }}  Issue Summary: {{ $json.summary }}  Recommended Action: {{ $json.recommended_action }}  Contact Email: {{ $json.contact_email }} Submitted: {{ $json.formatted_date }}  --- This is an automated alert from GreenLeaf Property Management System. Please respond immediately.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1056,
+        -64
+      ],
+      "id": "b70060e5-22fa-4785-9e65-5d9bcf6687d7",
+      "name": "Send a message",
+      "webhookId": "24ee2eda-8593-44dc-a73c-0a70e1f38824",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "IZf7WsYHBF9D71Je",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "=kfasih68@gmail.com",
+        "subject": "=New Maintenance Request - {{ $json.property_address }}",
+        "message": "=New Maintenance Request  Tenant: {{ $json.tenant_name }} Property: {{ $json.property_address }} Category: {{ $json.category }}  Issue Summary: {{ $json.summary }}  Recommended Action: {{ $json.recommended_action }}  Contact Email: {{ $json.contact_email }} Submitted: {{ $json.formatted_date }}  --- This is an automated notification from GreenLeaf Property Management System. Please schedule a visit at your earliest convenience.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        1056,
+        112
+      ],
+      "id": "2ef80077-9be3-425a-919b-8893b93173c9",
+      "name": "Send a message1",
+      "webhookId": "d8a70c41-78e0-4c1d-8585-bf28c24c06f3",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "IZf7WsYHBF9D71Je",
+          "name": "Gmail OAuth2 API"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        []
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send a message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "16498ace-4222-487f-b5af-d72ad70b2b9b",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "941853cd8ff81798f1a5e78c3768c68f406ed1da6060a3c0391620ece0df402d"
+  },
+  "id": "bfbNyAoe2sF1ksBm",
+  "tags": []
+}
